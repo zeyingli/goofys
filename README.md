@@ -20,6 +20,26 @@ close-to-open.
 
 * On Linux, install via [pre-built binaries](https://github.com/kahing/goofys/releases/). You may also need to install fuse-utils first.
 
+```Installation Prerequisite
+apt-get install openjdk-7-jre-headless
+apt-get install fuse
+wget https://storage.googleapis.com/golang/go1.8.3.linux-amd64.tar.gz
+sudo tar -xvf go1.8.3.linux-amd64.tar.gz
+sudo mv go /usr/local
+export GOROOT=/usr/local/go
+export GOPATH=$HOME/work
+export PATH=$GOPATH/bin:$GOROOT/bin:$PATH
+go -v
+go get github.com/kahing/goofys
+go install github.com/kahing/goofys
+touch ~/.aws/credentials
+[default]
+aws_access_key_id = id
+aws_secret_access_key = key
+$GOPATH/bin/goofys bucket-name /mount/point
+goofys#bucket-name   /mount/point        fuse     _netdev,allow_other,--file-mode=0755    0       0
+```
+
 * On Mac OS X, install via [Homebrew](http://brew.sh/):
 
 ```ShellSession
