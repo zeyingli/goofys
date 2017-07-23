@@ -29,7 +29,7 @@ sudo mv go /usr/local
 export GOROOT=/usr/local/go
 export GOPATH=$HOME/work
 export PATH=$GOPATH/bin:$GOROOT/bin:$PATH
-go -v
+go version (must be >=1.8)
 go get github.com/kahing/goofys
 go install github.com/kahing/goofys
 touch ~/.aws/credentials
