@@ -15,9 +15,7 @@
 package internal
 
 import (
-	"errors"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"sort"
@@ -32,159 +30,209 @@ import (
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
-
-	"github.com/sirupsen/logrus"
 )
 
+type InodeAttributes struct {
+	Size  uint64
+	Mtime time.Time
+}
+
 type Inode struct {
-	Id          fuseops.InodeID
-	Name        *string
-	FullName    *string
-	flags       *FlagStorage
-	Attributes  *fuseops.InodeAttributes
-	KnownSize   *uint64
+	Id         fuseops.InodeID
+	Name       *string
+	fs         *Goofys
+	Attributes *InodeAttributes
+	KnownSize  *uint64
+	AttrTime   time.Time
+
+	mu sync.Mutex // everything below is protected by mu
+
+	Parent *Inode
+
+	dir *DirInodeData
+
 	Invalid     bool
-	AttrTime    time.Time
 	ImplicitDir bool
+
+	fileHandles uint32
 
 	userMetadata map[string][]byte
 	s3Metadata   map[string][]byte
-
-	log *logHandle
-
-	mu      sync.Mutex          // everything below is protected by mu
-	handles map[*DirHandle]bool // value is ignored
 
 	// the refcnt is an exception, it's protected by the global lock
 	// Goofys.mu
 	refcnt uint64
 }
 
-func NewInode(name *string, fullName *string, flags *FlagStorage) (inode *Inode) {
-	inode = &Inode{Name: name, FullName: fullName, flags: flags}
-	inode.handles = make(map[*DirHandle]bool)
-	inode.refcnt = 1
-	inode.log = GetLogger(*fullName)
-	inode.AttrTime = time.Now()
-	inode.s3Metadata = make(map[string][]byte)
+func NewInode(fs *Goofys, parent *Inode, name *string, fullName *string) (inode *Inode) {
+	inode = &Inode{
+		Name:       name,
+		fs:         fs,
+		AttrTime:   time.Now(),
+		Parent:     parent,
+		s3Metadata: make(map[string][]byte),
+		refcnt:     1,
+	}
 
-	if inode.flags.DebugFuse {
-		inode.log.Level = logrus.DebugLevel
+	return
+}
+
+func (inode *Inode) FullName() *string {
+	if inode.Parent == nil {
+		return inode.Name
+	} else {
+		s := inode.Parent.getChildName(*inode.Name)
+		return &s
+	}
+}
+
+func (inode *Inode) InflateAttributes() (attr fuseops.InodeAttributes) {
+	attr = fuseops.InodeAttributes{
+		Size:   inode.Attributes.Size,
+		Atime:  inode.Attributes.Mtime,
+		Mtime:  inode.Attributes.Mtime,
+		Ctime:  inode.Attributes.Mtime,
+		Crtime: inode.Attributes.Mtime,
+		Uid:    inode.fs.flags.Uid,
+		Gid:    inode.fs.flags.Gid,
+	}
+
+	if inode.dir != nil {
+		attr.Nlink = 2
+		attr.Mode = inode.fs.flags.DirMode | os.ModeDir
+	} else {
+		attr.Nlink = 1
+		attr.Mode = inode.fs.flags.FileMode
 	}
 	return
-}
-
-type DirHandleEntry struct {
-	Attributes   fuseops.InodeAttributes // XXX use a smaller struct
-	ETag         *string
-	StorageClass *string
-}
-
-func (entry DirHandleEntry) Init(attr *fuseops.InodeAttributes) *DirHandleEntry {
-	entry.Attributes = *attr
-	return &entry
-}
-
-type DirHandle struct {
-	inode *Inode
-
-	mu          sync.Mutex // everything below is protected by mu
-	Entries     []fuseutil.Dirent
-	NameToEntry map[string]*DirHandleEntry
-	Marker      *string
-	BaseOffset  int
-}
-
-func NewDirHandle(inode *Inode) (dh *DirHandle) {
-	dh = &DirHandle{inode: inode}
-	dh.NameToEntry = make(map[string]*DirHandleEntry)
-	return
-}
-
-type FileHandle struct {
-	inode *Inode
-
-	dirty     bool
-	writeInit sync.Once
-	mpuWG     sync.WaitGroup
-	etags     []*string
-
-	mu              sync.Mutex
-	mpuId           *string
-	nextWriteOffset int64
-	lastPartId      int
-
-	poolHandle *BufferPool
-	//buf        []byte
-	buf *MBuf
-
-	lastWriteError error
-
-	// read
-	reader        io.ReadCloser
-	readBufOffset int64
-
-	// parallel read
-	buffers           []*S3ReadBuffer
-	existingReadahead int
-	seqReadAmount     uint64
-	numOOORead        uint64 // number of out of order read
-}
-
-const MAX_READAHEAD = uint32(100 * 1024 * 1024)
-const READAHEAD_CHUNK = uint32(20 * 1024 * 1024)
-
-func NewFileHandle(in *Inode) *FileHandle {
-	fh := &FileHandle{inode: in}
-	return fh
 }
 
 func (inode *Inode) logFuse(op string, args ...interface{}) {
-	fuseLog.Debugln(op, inode.Id, *inode.FullName, args)
+	fuseLog.Debugln(op, inode.Id, inode.FullName(), args)
 }
 
 func (inode *Inode) errFuse(op string, args ...interface{}) {
-	fuseLog.Errorln(op, inode.Id, *inode.FullName, args)
+	fuseLog.Errorln(op, inode.Id, inode.FullName(), args)
 }
 
-// LOCKS_REQUIRED(parent.mu)
-func (parent *Inode) lookupFromDirHandles(name string) (inode *Inode) {
+func (inode *Inode) ToDir() {
+	inode.Attributes = &inode.fs.rootAttrs
+	inode.dir = &DirInodeData{}
+	inode.KnownSize = &inode.fs.rootAttrs.Size
+}
+
+func (parent *Inode) findChild(name string) (inode *Inode) {
 	parent.mu.Lock()
 	defer parent.mu.Unlock()
 
-	for dh := range parent.handles {
-		dh.mu.Lock()
-		defer dh.mu.Unlock()
-
-		entry, ok := dh.NameToEntry[name]
-		if ok {
-			fullName := parent.getChildName(name)
-			inode = NewInode(&name, &fullName, parent.flags)
-			inode.Attributes = &entry.Attributes
-			size := inode.Attributes.Size
-			inode.KnownSize = &size
-			if entry.ETag != nil {
-				inode.s3Metadata["etag"] = []byte(*entry.ETag)
-			}
-			if entry.StorageClass != nil {
-				inode.s3Metadata["storage-class"] = []byte(*entry.StorageClass)
-			}
-			return
-		}
-	}
-
+	inode = parent.findChildUnlockedFull(name)
 	return
 }
 
-func (parent *Inode) LookUp(fs *Goofys, name string) (inode *Inode, err error) {
-	parent.logFuse("Inode.LookUp", name)
+func (parent *Inode) findInodeFunc(name string, isDir bool) func(i int) bool {
+	// sort dirs first, then by name
+	return func(i int) bool {
+		if parent.dir.Children[i].isDir() != isDir {
+			return isDir
+		}
+		return (*parent.dir.Children[i].Name) >= name
+	}
+}
 
-	inode = parent.lookupFromDirHandles(name)
-	if inode != nil {
+func (parent *Inode) findChildUnlockedFull(name string) (inode *Inode) {
+	inode = parent.findChildUnlocked(name, false)
+	if inode == nil {
+		inode = parent.findChildUnlocked(name, true)
+	}
+	return
+}
+
+func (parent *Inode) findChildUnlocked(name string, isDir bool) (inode *Inode) {
+	l := len(parent.dir.Children)
+	if l == 0 {
+		return
+	}
+	i := sort.Search(l, parent.findInodeFunc(name, isDir))
+	if i < l {
+		// found
+		if *parent.dir.Children[i].Name == name {
+			inode = parent.dir.Children[i]
+		}
+	}
+	return
+}
+
+func (parent *Inode) findChildIdxUnlocked(name string) int {
+	l := len(parent.dir.Children)
+	if l == 0 {
+		return -1
+	}
+	i := sort.Search(l, parent.findInodeFunc(name, true))
+	if i < l {
+		// found
+		if *parent.dir.Children[i].Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func (parent *Inode) removeChildUnlocked(inode *Inode) {
+	l := len(parent.dir.Children)
+	if l == 0 {
+		return
+	}
+	i := sort.Search(l, parent.findInodeFunc(*inode.Name, inode.isDir()))
+	if i >= l || *parent.dir.Children[i].Name != *inode.Name {
+		panic(fmt.Sprintf("%v.removeName(%v) but child not found: %v",
+			*parent.FullName(), *inode.Name, i))
+	}
+
+	copy(parent.dir.Children[i:], parent.dir.Children[i+1:])
+	parent.dir.Children = parent.dir.Children[:l-1]
+}
+
+func (parent *Inode) removeChild(inode *Inode) {
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+
+	parent.removeChildUnlocked(inode)
+	return
+}
+
+func (parent *Inode) insertChild(inode *Inode) {
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+
+	parent.insertChildUnlocked(inode)
+}
+
+func (parent *Inode) insertChildUnlocked(inode *Inode) {
+	l := len(parent.dir.Children)
+	if l == 0 {
+		parent.dir.Children = []*Inode{inode}
 		return
 	}
 
-	inode, err = fs.LookUpInodeMaybeDir(name, parent.getChildName(name))
+	i := sort.Search(l, parent.findInodeFunc(*inode.Name, inode.isDir()))
+	if i == l {
+		// not found = new value is the biggest
+		parent.dir.Children = append(parent.dir.Children, inode)
+	} else {
+		if *parent.dir.Children[i].Name == *inode.Name {
+			panic(fmt.Sprintf("double insert of %v", parent.getChildName(*inode.Name)))
+		}
+
+		parent.dir.Children = append(parent.dir.Children, nil)
+		copy(parent.dir.Children[i+1:], parent.dir.Children[i:])
+		parent.dir.Children[i] = inode
+	}
+}
+
+func (parent *Inode) LookUp(name string) (inode *Inode, err error) {
+	parent.logFuse("Inode.LookUp", name)
+
+	inode, err = parent.LookUpInodeMaybeDir(name, parent.getChildName(name))
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +244,7 @@ func (parent *Inode) getChildName(name string) string {
 	if parent.Id == fuseops.RootInodeID {
 		return name
 	} else {
-		return fmt.Sprintf("%v/%v", *parent.FullName, name)
+		return fmt.Sprintf("%v/%v", *parent.FullName(), name)
 	}
 }
 
@@ -206,11 +254,6 @@ func (parent *Inode) getChildName(name string) string {
 // that was legacy
 func (inode *Inode) Ref() {
 	inode.logFuse("Ref", inode.refcnt)
-
-	if inode.refcnt == 0 {
-		fuseLog.Errorln("Ref", inode.Id, *inode.FullName, "refcnt == 0")
-		panic("refcnt == 0")
-	}
 
 	inode.refcnt++
 	return
@@ -230,17 +273,17 @@ func (inode *Inode) DeRef(n uint64) (stale bool) {
 	return
 }
 
-func (parent *Inode) Unlink(fs *Goofys, name string) (err error) {
+func (parent *Inode) Unlink(name string) (err error) {
 	parent.logFuse("Unlink", name)
 
 	fullName := parent.getChildName(name)
 
 	params := &s3.DeleteObjectInput{
-		Bucket: &fs.bucket,
-		Key:    fs.key(fullName),
+		Bucket: &parent.fs.bucket,
+		Key:    parent.fs.key(fullName),
 	}
 
-	resp, err := fs.s3.DeleteObject(params)
+	resp, err := parent.fs.s3.DeleteObject(params)
 	if err != nil {
 		return mapAwsError(err)
 	}
@@ -251,44 +294,38 @@ func (parent *Inode) Unlink(fs *Goofys, name string) (err error) {
 }
 
 func (parent *Inode) Create(
-	fs *Goofys,
 	name string) (inode *Inode, fh *FileHandle) {
 
 	parent.logFuse("Create", name)
 	fullName := parent.getChildName(name)
+	fs := parent.fs
 
 	parent.mu.Lock()
 	defer parent.mu.Unlock()
 
 	now := time.Now()
-	inode = NewInode(&name, &fullName, parent.flags)
-	inode.Attributes = &fuseops.InodeAttributes{
-		Size:   0,
-		Nlink:  1,
-		Mode:   fs.flags.FileMode,
-		Atime:  now,
-		Mtime:  now,
-		Ctime:  now,
-		Crtime: now,
-		Uid:    fs.flags.Uid,
-		Gid:    fs.flags.Gid,
+	inode = NewInode(fs, parent, &name, &fullName)
+	inode.Attributes = &InodeAttributes{
+		Size:  0,
+		Mtime: now,
 	}
 
 	fh = NewFileHandle(inode)
 	fh.poolHandle = fs.bufferPool
 	fh.buf = MBuf{}.Init(fh.poolHandle, 0, true)
 	fh.dirty = true
+	inode.fileHandles = 1
 
 	return
 }
 
 func (parent *Inode) MkDir(
-	fs *Goofys,
 	name string) (inode *Inode, err error) {
 
 	parent.logFuse("MkDir", name)
 
 	fullName := parent.getChildName(name)
+	fs := parent.fs
 
 	params := &s3.PutObjectInput{
 		Bucket: &fs.bucket,
@@ -312,9 +349,8 @@ func (parent *Inode) MkDir(
 	parent.mu.Lock()
 	defer parent.mu.Unlock()
 
-	inode = NewInode(&name, &fullName, parent.flags)
-	inode.Attributes = &fs.rootAttrs
-	inode.KnownSize = &inode.Attributes.Size
+	inode = NewInode(fs, parent, &name, &fullName)
+	inode.ToDir()
 
 	return
 }
@@ -352,12 +388,12 @@ func isEmptyDir(fs *Goofys, fullName string) (isDir bool, err error) {
 }
 
 func (parent *Inode) RmDir(
-	fs *Goofys,
 	name string) (err error) {
 
 	parent.logFuse("Rmdir", name)
 
 	fullName := parent.getChildName(name)
+	fs := parent.fs
 
 	isDir, err := isEmptyDir(fs, fullName)
 	if err != nil {
@@ -382,17 +418,18 @@ func (parent *Inode) RmDir(
 	return
 }
 
-func (inode *Inode) GetAttributes(fs *Goofys) (*fuseops.InodeAttributes, error) {
+func (inode *Inode) GetAttributes() (*fuseops.InodeAttributes, error) {
 	// XXX refresh attributes
 	inode.logFuse("GetAttributes")
 	if inode.Invalid {
 		return nil, fuse.ENOENT
 	}
-	return inode.Attributes, nil
+	attr := inode.InflateAttributes()
+	return &attr, nil
 }
 
 func (inode *Inode) isDir() bool {
-	return inode.Attributes.Mode&os.ModeDir != 0
+	return inode.dir != nil
 }
 
 // LOCKS_REQUIRED(inode.mu)
@@ -404,6 +441,8 @@ func (inode *Inode) fillXattrFromHead(resp *s3.HeadObjectOutput) {
 	}
 	if resp.StorageClass != nil {
 		inode.s3Metadata["storage-class"] = []byte(*resp.StorageClass)
+	} else {
+		inode.s3Metadata["storage-class"] = []byte("STANDARD")
 	}
 
 	for k, v := range resp.Metadata {
@@ -417,14 +456,14 @@ func (inode *Inode) fillXattrFromHead(resp *s3.HeadObjectOutput) {
 }
 
 // LOCKS_REQUIRED(inode.mu)
-func (inode *Inode) fillXattr(fs *Goofys) (err error) {
-	if !inode.ImplicitDir &&
-		(len(inode.s3Metadata) == 0 && inode.userMetadata == nil) {
+func (inode *Inode) fillXattr() (err error) {
+	if !inode.ImplicitDir && inode.userMetadata == nil {
 
-		fullName := *inode.FullName
+		fullName := *inode.FullName()
 		if inode.isDir() {
 			fullName += "/"
 		}
+		fs := inode.fs
 
 		params := &s3.HeadObjectInput{Bucket: &fs.bucket, Key: fs.key(fullName)}
 		resp, err := fs.s3.HeadObject(params)
@@ -446,13 +485,8 @@ func (inode *Inode) fillXattr(fs *Goofys) (err error) {
 }
 
 // LOCKS_REQUIRED(inode.mu)
-func (inode *Inode) getXattrMap(fs *Goofys, name string, userOnly bool) (
+func (inode *Inode) getXattrMap(name string, userOnly bool) (
 	meta map[string][]byte, newName string, err error) {
-
-	err = inode.fillXattr(fs)
-	if err != nil {
-		return nil, "", err
-	}
 
 	if strings.HasPrefix(name, "s3.") {
 		if userOnly {
@@ -462,6 +496,11 @@ func (inode *Inode) getXattrMap(fs *Goofys, name string, userOnly bool) (
 		newName = name[3:]
 		meta = inode.s3Metadata
 	} else if strings.HasPrefix(name, "user.") {
+		err = inode.fillXattr()
+		if err != nil {
+			return nil, "", err
+		}
+
 		newName = name[5:]
 		meta = inode.userMetadata
 	} else {
@@ -488,20 +527,20 @@ func convertMetadata(meta map[string][]byte) (metadata map[string]*string) {
 }
 
 // LOCKS_REQUIRED(inode.mu)
-func (inode *Inode) updateXattr(fs *Goofys) (err error) {
-	err = fs.copyObjectMaybeMultipart(int64(inode.Attributes.Size),
-		*inode.FullName, *inode.FullName,
+func (inode *Inode) updateXattr() (err error) {
+	err = copyObjectMaybeMultipart(inode.fs, int64(inode.Attributes.Size),
+		*inode.FullName(), *inode.FullName(),
 		aws.String(string(inode.s3Metadata["etag"])), convertMetadata(inode.userMetadata))
 	return
 }
 
-func (inode *Inode) SetXattr(fs *Goofys, name string, value []byte, flags uint32) error {
+func (inode *Inode) SetXattr(name string, value []byte, flags uint32) error {
 	inode.logFuse("RemoveXattr", name)
 
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
 
-	meta, name, err := inode.getXattrMap(fs, name, true)
+	meta, name, err := inode.getXattrMap(name, true)
 	if err != nil {
 		return err
 	}
@@ -520,37 +559,37 @@ func (inode *Inode) SetXattr(fs *Goofys, name string, value []byte, flags uint32
 	}
 
 	meta[name] = Dup(value)
-	err = inode.updateXattr(fs)
+	err = inode.updateXattr()
 	return err
 }
 
-func (inode *Inode) RemoveXattr(fs *Goofys, name string) error {
+func (inode *Inode) RemoveXattr(name string) error {
 	inode.logFuse("RemoveXattr", name)
 
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
 
-	meta, name, err := inode.getXattrMap(fs, name, true)
+	meta, name, err := inode.getXattrMap(name, true)
 	if err != nil {
 		return err
 	}
 
 	if _, ok := meta[name]; ok {
 		delete(meta, name)
-		err = inode.updateXattr(fs)
+		err = inode.updateXattr()
 		return err
 	} else {
 		return syscall.ENODATA
 	}
 }
 
-func (inode *Inode) GetXattr(fs *Goofys, name string) ([]byte, error) {
+func (inode *Inode) GetXattr(name string) ([]byte, error) {
 	inode.logFuse("GetXattr", name)
 
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
 
-	meta, name, err := inode.getXattrMap(fs, name, false)
+	meta, name, err := inode.getXattrMap(name, false)
 	if err != nil {
 		return nil, err
 	}
@@ -563,7 +602,7 @@ func (inode *Inode) GetXattr(fs *Goofys, name string) ([]byte, error) {
 	}
 }
 
-func (inode *Inode) ListXattr(fs *Goofys) ([]string, error) {
+func (inode *Inode) ListXattr() ([]string, error) {
 	inode.logFuse("ListXattr")
 
 	inode.mu.Lock()
@@ -571,7 +610,7 @@ func (inode *Inode) ListXattr(fs *Goofys) ([]string, error) {
 
 	var xattrs []string
 
-	err := inode.fillXattr(fs)
+	err := inode.fillXattr()
 	if err != nil {
 		return nil, err
 	}
@@ -587,666 +626,28 @@ func (inode *Inode) ListXattr(fs *Goofys) ([]string, error) {
 	return xattrs, nil
 }
 
-func (inode *Inode) OpenFile(fs *Goofys) *FileHandle {
+func (inode *Inode) OpenFile() (fh *FileHandle, err error) {
 	inode.logFuse("OpenFile")
-	return NewFileHandle(inode)
-}
 
-func (fh *FileHandle) initWrite(fs *Goofys) {
-	fh.writeInit.Do(func() {
-		fh.mpuWG.Add(1)
-		go fh.initMPU(fs)
-	})
-}
+	inode.mu.Lock()
+	defer inode.mu.Unlock()
 
-func (fh *FileHandle) initMPU(fs *Goofys) {
-	defer func() {
-		fh.mpuWG.Done()
-	}()
-
-	params := &s3.CreateMultipartUploadInput{
-		Bucket:       &fs.bucket,
-		Key:          fs.key(*fh.inode.FullName),
-		StorageClass: &fs.flags.StorageClass,
-		ContentType:  fs.getMimeType(*fh.inode.FullName),
-	}
-
-	if fs.flags.UseSSE {
-		params.ServerSideEncryption = &fs.sseType
-		if fs.flags.UseKMS && fs.flags.KMSKeyID != "" {
-			params.SSEKMSKeyId = &fs.flags.KMSKeyID
-		}
-	}
-
-	if fs.flags.ACL != "" {
-		params.ACL = &fs.flags.ACL
-	}
-
-	resp, err := fs.s3.CreateMultipartUpload(params)
-
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
-
-	if err != nil {
-		fh.lastWriteError = mapAwsError(err)
-	}
-
-	s3Log.Debug(resp)
-
-	fh.mpuId = resp.UploadId
-	fh.etags = make([]*string, 10000) // at most 10K parts
-
+	fh = NewFileHandle(inode)
+	inode.fileHandles += 1
 	return
 }
 
-func (fh *FileHandle) mpuPartNoSpawn(fs *Goofys, buf *MBuf, part int) (err error) {
-	//fh.inode.logFuse("mpuPartNoSpawn", cap(buf), part)
-	fs.replicators.Take(1, true)
-	defer fs.replicators.Return(1)
-
-	defer buf.Free()
-
-	if part == 0 || part > 10000 {
-		return errors.New(fmt.Sprintf("invalid part number: %v", part))
-	}
-
-	params := &s3.UploadPartInput{
-		Bucket:     &fs.bucket,
-		Key:        fs.key(*fh.inode.FullName),
-		PartNumber: aws.Int64(int64(part)),
-		UploadId:   fh.mpuId,
-		Body:       buf,
-	}
-
-	s3Log.Debug(params)
-
-	resp, err := fs.s3.UploadPart(params)
-	if err != nil {
-		return mapAwsError(err)
-	}
-
-	en := &fh.etags[part-1]
-
-	if *en != nil {
-		panic(fmt.Sprintf("etags for part %v already set: %v", part, **en))
-	}
-	*en = resp.ETag
-	return
-}
-
-func (fh *FileHandle) mpuPart(fs *Goofys, buf *MBuf, part int) {
-	defer func() {
-		fh.mpuWG.Done()
-	}()
-
-	// maybe wait for CreateMultipartUpload
-	if fh.mpuId == nil {
-		fh.mpuWG.Wait()
-		// initMPU might have errored
-		if fh.mpuId == nil {
-			return
-		}
-	}
-
-	err := fh.mpuPartNoSpawn(fs, buf, part)
-	if err != nil {
-		if fh.lastWriteError == nil {
-			fh.lastWriteError = mapAwsError(err)
-		}
-	}
-}
-
-func (fh *FileHandle) waitForCreateMPU(fs *Goofys) (err error) {
-	if fh.mpuId == nil {
-		fh.mu.Unlock()
-		fh.initWrite(fs)
-		fh.mpuWG.Wait() // wait for initMPU
-		fh.mu.Lock()
-
-		if fh.lastWriteError != nil {
-			return fh.lastWriteError
-		}
-	}
-
-	return
-}
-
-func (fh *FileHandle) partSize() uint64 {
-	if fh.lastPartId < 1000 {
-		return 5 * 1024 * 1024
-	} else if fh.lastPartId < 2000 {
-		return 25 * 1024 * 1024
-	} else {
-		return 125 * 1024 * 1024
-	}
-}
-
-func (fh *FileHandle) WriteFile(fs *Goofys, offset int64, data []byte) (err error) {
-	fh.inode.logFuse("WriteFile", offset, len(data))
-
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
-
-	if fh.lastWriteError != nil {
-		return fh.lastWriteError
-	}
-
-	if offset != fh.nextWriteOffset {
-		fh.inode.errFuse("WriteFile: only sequential writes supported", fh.nextWriteOffset, offset)
-		fh.lastWriteError = fuse.EINVAL
-		return fh.lastWriteError
-	}
-
-	if offset == 0 {
-		fh.poolHandle = fs.bufferPool
-		fh.buf = MBuf{}.Init(fh.poolHandle, 0, true)
-		fh.dirty = true
-	}
-
-	for {
-		if fh.buf == nil || fh.buf.Full() {
-			fh.buf = MBuf{}.Init(fh.poolHandle, fh.partSize(), true)
-		}
-
-		nCopied, _ := fh.buf.Write(data)
-		fh.nextWriteOffset += int64(nCopied)
-
-		if fh.buf.Full() {
-			// we filled this buffer, upload this part
-			err = fh.waitForCreateMPU(fs)
-			if err != nil {
-				return
-			}
-
-			fh.lastPartId++
-			part := fh.lastPartId
-			buf := fh.buf
-			fh.buf = nil
-			fh.mpuWG.Add(1)
-
-			go fh.mpuPart(fs, buf, part)
-		}
-
-		if nCopied == len(data) {
-			break
-		}
-
-		data = data[nCopied:]
-	}
-
-	fh.inode.Attributes.Size = uint64(fh.nextWriteOffset)
-
-	return
-}
-
-type S3ReadBuffer struct {
-	s3     *s3.S3
-	offset uint64
-	size   uint32
-	buf    *Buffer
-}
-
-func (b S3ReadBuffer) Init(fs *Goofys, fh *FileHandle, offset uint64, size uint32) *S3ReadBuffer {
-	b.s3 = fs.s3
-	b.offset = offset
-	b.size = size
-
-	mbuf := MBuf{}.Init(fh.poolHandle, uint64(size), false)
-	if mbuf == nil {
-		return nil
-	}
-
-	b.buf = Buffer{}.Init(mbuf, func() (io.ReadCloser, error) {
-		params := &s3.GetObjectInput{
-			Bucket: &fs.bucket,
-			Key:    fs.key(*fh.inode.FullName),
-		}
-
-		bytes := fmt.Sprintf("bytes=%v-%v", offset, offset+uint64(size)-1)
-		params.Range = &bytes
-
-		req, resp := fs.s3.GetObjectRequest(params)
-
-		err := req.Send()
-		if err != nil {
-			return nil, mapAwsError(err)
-		}
-
-		return resp.Body, nil
-	})
-
-	return &b
-}
-
-func (b *S3ReadBuffer) Read(offset uint64, p []byte) (n int, err error) {
-	if b.offset == offset {
-		n, err = io.ReadFull(b.buf, p)
-		if n != 0 && err == io.ErrUnexpectedEOF {
-			err = nil
-		}
-		if err == nil {
-			if uint32(n) > b.size {
-				panic(fmt.Sprintf("read more than available %v %v", n, b.size))
-			}
-
-			b.offset += uint64(n)
-			b.size -= uint32(n)
-		}
-
-		return
-	} else {
-		panic(fmt.Sprintf("not the right buffer, expecting %v got %v, %v left", b.offset, offset, b.size))
-		err = errors.New(fmt.Sprintf("not the right buffer, expecting %v got %v", b.offset, offset))
-		return
-	}
-}
-
-func (fh *FileHandle) readFromReadAhead(fs *Goofys, offset uint64, buf []byte) (bytesRead int, err error) {
-	var nread int
-	for len(fh.buffers) != 0 {
-		nread, err = fh.buffers[0].Read(offset+uint64(bytesRead), buf)
-		bytesRead += nread
-		if err != nil {
-			return
-		}
-
-		if fh.buffers[0].size == 0 {
-			// we've exhausted the first buffer
-			fh.buffers[0].buf.Close()
-			fh.buffers = fh.buffers[1:]
-		}
-
-		buf = buf[nread:]
-
-		if len(buf) == 0 {
-			// we've filled the user buffer
-			return
-		}
-	}
-
-	return
-}
-
-func (fh *FileHandle) readAhead(fs *Goofys, offset uint64, needAtLeast int) (err error) {
-	existingReadahead := uint32(0)
-	for _, b := range fh.buffers {
-		existingReadahead += b.size
-	}
-
-	readAheadAmount := MAX_READAHEAD
-
-	for readAheadAmount-existingReadahead >= READAHEAD_CHUNK {
-		off := offset + uint64(existingReadahead)
-		remaining := fh.inode.Attributes.Size - off
-
-		// only read up to readahead chunk each time
-		size := MinUInt32(readAheadAmount-existingReadahead, READAHEAD_CHUNK)
-		// but don't read past the file
-		size = uint32(MinUInt64(uint64(size), remaining))
-
-		if size != 0 {
-			fh.inode.logFuse("readahead", off, size, existingReadahead)
-
-			readAheadBuf := S3ReadBuffer{}.Init(fs, fh, off, size)
-			if readAheadBuf != nil {
-				fh.buffers = append(fh.buffers, readAheadBuf)
-				existingReadahead += size
-			} else {
-				if existingReadahead != 0 {
-					// don't do more readahead now, but don't fail, cross our
-					// fingers that we will be able to allocate the buffers
-					// later
-					return nil
-				} else {
-					return syscall.ENOMEM
-				}
-			}
-		}
-
-		if size != READAHEAD_CHUNK {
-			// that was the last remaining chunk to readahead
-			break
-		}
-	}
-
-	return nil
-}
-
-func (fh *FileHandle) ReadFile(fs *Goofys, offset int64, buf []byte) (bytesRead int, err error) {
-	fh.inode.logFuse("ReadFile", offset, len(buf))
-	defer func() {
-		fh.inode.logFuse("< ReadFile", bytesRead, err)
-
-		if err != nil {
-			if bytesRead > 0 || err == io.EOF {
-				err = nil
-			}
-		}
-	}()
-
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
-
-	nwant := len(buf)
-	var nread int
-
-	for bytesRead < nwant && err == nil {
-		nread, err = fh.readFile(fs, offset+int64(bytesRead), buf[bytesRead:])
-		if nread > 0 {
-			bytesRead += nread
-		}
-	}
-
-	return
-}
-
-func (fh *FileHandle) readFile(fs *Goofys, offset int64, buf []byte) (bytesRead int, err error) {
-	defer func() {
-		if bytesRead > 0 {
-			fh.readBufOffset += int64(bytesRead)
-			fh.seqReadAmount += uint64(bytesRead)
-		}
-
-		fh.inode.logFuse("< readFile", bytesRead, err)
-	}()
-
-	if uint64(offset) >= fh.inode.Attributes.Size {
-		// nothing to read
-		if fh.inode.Invalid {
-			err = fuse.ENOENT
-		} else if fh.inode.KnownSize == nil {
-			err = io.EOF
-		} else {
-			err = io.EOF
-		}
-		return
-	}
-
-	if fh.poolHandle == nil {
-		fh.poolHandle = fs.bufferPool
-	}
-
-	if fh.readBufOffset != offset {
-		// XXX out of order read, maybe disable prefetching
-		fh.inode.logFuse("out of order read", offset, fh.readBufOffset)
-
-		fh.readBufOffset = offset
-		fh.seqReadAmount = 0
-		if fh.reader != nil {
-			fh.reader.Close()
-			fh.reader = nil
-		}
-
-		if fh.buffers != nil {
-			// we misdetected
-			fh.numOOORead++
-		}
-
-		for _, b := range fh.buffers {
-			b.buf.Close()
-		}
-		fh.buffers = nil
-	}
-
-	if !fs.flags.Cheap && fh.seqReadAmount >= uint64(READAHEAD_CHUNK) && fh.numOOORead < 3 {
-		if fh.reader != nil {
-			fh.inode.logFuse("cutover to the parallel algorithm")
-			fh.reader.Close()
-			fh.reader = nil
-		}
-
-		err = fh.readAhead(fs, uint64(offset), len(buf))
-		if err == nil {
-			bytesRead, err = fh.readFromReadAhead(fs, uint64(offset), buf)
-			return
-		} else {
-			// fall back to read serially
-			fh.inode.logFuse("not enough memory, fallback to serial read")
-			fh.seqReadAmount = 0
-			for _, b := range fh.buffers {
-				b.buf.Close()
-			}
-			fh.buffers = nil
-		}
-	}
-
-	bytesRead, err = fh.readFromStream(fs, offset, buf)
-
-	return
-}
-
-func (fh *FileHandle) Release() {
-	// read buffers
-	for _, b := range fh.buffers {
-		b.buf.Close()
-	}
-	fh.buffers = nil
-
-	if fh.reader != nil {
-		fh.reader.Close()
-	}
-
-	// write buffers
-	if fh.poolHandle != nil {
-		if fh.buf != nil && fh.buf.buffers != nil {
-			if fh.lastWriteError == nil {
-				panic("buf not freed but error is nil")
-			}
-
-			fh.buf.Free()
-			// the other in-flight multipart PUT buffers will be
-			// freed when they finish/error out
-		}
-	}
-}
-
-func (fh *FileHandle) readFromStream(fs *Goofys, offset int64, buf []byte) (bytesRead int, err error) {
-	defer func() {
-		if fh.inode.flags.DebugFuse {
-			fh.inode.logFuse("< readFromStream", bytesRead)
-		}
-	}()
-
-	if uint64(offset) >= fh.inode.Attributes.Size {
-		// nothing to read
-		return
-	}
-
-	if fh.reader == nil {
-		params := &s3.GetObjectInput{
-			Bucket: &fs.bucket,
-			Key:    fs.key(*fh.inode.FullName),
-		}
-
-		if offset != 0 {
-			bytes := fmt.Sprintf("bytes=%v-", offset)
-			params.Range = &bytes
-		}
-
-		req, resp := fs.s3.GetObjectRequest(params)
-
-		err = req.Send()
-		if err != nil {
-			return bytesRead, mapAwsError(err)
-		}
-
-		fh.reader = resp.Body
-	}
-
-	bytesRead, err = fh.reader.Read(buf)
-	if err != nil {
-		if err != io.EOF {
-			fh.inode.logFuse("< readFromStream error", bytesRead, err)
-		}
-		// always retry error on read
-		fh.reader.Close()
-		fh.reader = nil
-		err = nil
-	}
-
-	return
-}
-
-func (fh *FileHandle) flushSmallFile(fs *Goofys) (err error) {
-	buf := fh.buf
-	fh.buf = nil
-
-	if buf == nil {
-		panic(fmt.Sprintf("%s size is %d", *fh.inode.Name, fh.nextWriteOffset))
-	}
-
-	defer buf.Free()
-
-	params := &s3.PutObjectInput{
-		Bucket:       &fs.bucket,
-		Key:          fs.key(*fh.inode.FullName),
-		Body:         buf,
-		StorageClass: &fs.flags.StorageClass,
-		ContentType:  fs.getMimeType(*fh.inode.FullName),
-	}
-
-	if fs.flags.UseSSE {
-		params.ServerSideEncryption = &fs.sseType
-		if fs.flags.UseKMS && fs.flags.KMSKeyID != "" {
-			params.SSEKMSKeyId = &fs.flags.KMSKeyID
-		}
-	}
-
-	if fs.flags.ACL != "" {
-		params.ACL = &fs.flags.ACL
-	}
-
-	fs.replicators.Take(1, true)
-	defer fs.replicators.Return(1)
-
-	_, err = fs.s3.PutObject(params)
-	if err != nil {
-		err = mapAwsError(err)
-		fh.lastWriteError = err
-	}
-	return
-}
-
-func (fh *FileHandle) resetToKnownSize() {
-	if fh.inode.KnownSize != nil {
-		fh.inode.Attributes.Size = *fh.inode.KnownSize
-	} else {
-		fh.inode.Attributes.Size = 0
-		fh.inode.Invalid = true
-	}
-}
-
-func (fh *FileHandle) FlushFile(fs *Goofys) (err error) {
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
-
-	fh.inode.logFuse("FlushFile")
-
-	if !fh.dirty || fh.lastWriteError != nil {
-		if fh.lastWriteError != nil {
-			err = fh.lastWriteError
-			fh.resetToKnownSize()
-		}
-		return
-	}
-
-	// abort mpu on error
-	defer func() {
-		if err != nil {
-			if fh.mpuId != nil {
-				go func() {
-					params := &s3.AbortMultipartUploadInput{
-						Bucket:   &fs.bucket,
-						Key:      fs.key(*fh.inode.FullName),
-						UploadId: fh.mpuId,
-					}
-
-					fh.mpuId = nil
-					resp, _ := fs.s3.AbortMultipartUpload(params)
-					s3Log.Debug(resp)
-				}()
-			}
-
-			fh.resetToKnownSize()
-		} else {
-			if fh.dirty {
-				// don't unset this if we never actually flushed
-				size := fh.inode.Attributes.Size
-				fh.inode.KnownSize = &size
-				fh.inode.Invalid = false
-			}
-			fh.dirty = false
-		}
-
-		fh.writeInit = sync.Once{}
-		fh.nextWriteOffset = 0
-		fh.lastPartId = 0
-	}()
-
-	if fh.lastPartId == 0 {
-		return fh.flushSmallFile(fs)
-	}
-
-	fh.mpuWG.Wait()
-
-	if fh.lastWriteError != nil {
-		return fh.lastWriteError
-	}
-
-	if fh.mpuId == nil {
-		return
-	}
-
-	nParts := fh.lastPartId
-	if fh.buf != nil {
-		// upload last part
-		nParts++
-		err = fh.mpuPartNoSpawn(fs, fh.buf, nParts)
-		if err != nil {
-			return
-		}
-	}
-
-	parts := make([]*s3.CompletedPart, nParts)
-	for i := 0; i < nParts; i++ {
-		parts[i] = &s3.CompletedPart{
-			ETag:       fh.etags[i],
-			PartNumber: aws.Int64(int64(i + 1)),
-		}
-	}
-
-	params := &s3.CompleteMultipartUploadInput{
-		Bucket:   &fs.bucket,
-		Key:      fs.key(*fh.inode.FullName),
-		UploadId: fh.mpuId,
-		MultipartUpload: &s3.CompletedMultipartUpload{
-			Parts: parts,
-		},
-	}
-
-	s3Log.Debug(params)
-
-	resp, err := fs.s3.CompleteMultipartUpload(params)
-	if err != nil {
-		return mapAwsError(err)
-	}
-
-	s3Log.Debug(resp)
-	fh.mpuId = nil
-
-	return
-}
-
-func (parent *Inode) Rename(fs *Goofys, from string, newParent *Inode, to string) (err error) {
+func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error) {
 	parent.logFuse("Rename", from, newParent.getChildName(to))
 
 	fromFullName := parent.getChildName(from)
+	fs := parent.fs
 
-	// XXX don't hold the lock the entire time
-	parent.mu.Lock()
-	defer parent.mu.Unlock()
+	var size int64
+	var fromIsDir bool
+	var toIsDir bool
 
-	fromIsDir, err := isEmptyDir(fs, fromFullName)
+	fromIsDir, err = isEmptyDir(fs, fromFullName)
 	if err != nil {
 		// we don't support renaming a directory that's not empty
 		return
@@ -1254,18 +655,16 @@ func (parent *Inode) Rename(fs *Goofys, from string, newParent *Inode, to string
 
 	toFullName := newParent.getChildName(to)
 
-	if parent != newParent {
-		newParent.mu.Lock()
-		defer newParent.mu.Unlock()
-	}
-
-	toIsDir, err := isEmptyDir(fs, toFullName)
+	toIsDir, err = isEmptyDir(fs, toFullName)
 	if err != nil {
 		return
 	}
 
 	if fromIsDir && !toIsDir {
-		_, err = fs.s3.HeadObject(&s3.HeadObjectInput{Bucket: &fs.bucket, Key: fs.key(toFullName)})
+		_, err = fs.s3.HeadObject(&s3.HeadObjectInput{
+			Bucket: &fs.bucket,
+			Key:    fs.key(toFullName),
+		})
 		if err == nil {
 			return fuse.ENOTDIR
 		} else {
@@ -1278,14 +677,204 @@ func (parent *Inode) Rename(fs *Goofys, from string, newParent *Inode, to string
 		return syscall.EISDIR
 	}
 
-	size := int64(-1)
+	size = int64(-1)
 	if fromIsDir {
 		fromFullName += "/"
 		toFullName += "/"
 		size = 0
 	}
 
-	err = fs.copyObjectMaybeMultipart(size, fromFullName, toFullName, nil, nil)
+	err = renameObject(fs, size, fromFullName, toFullName)
+	return
+}
+
+func mpuCopyPart(fs *Goofys, from string, to string, mpuId string, bytes string, part int64,
+	wg *sync.WaitGroup, srcEtag *string, etag **string, errout *error) {
+
+	defer func() {
+		wg.Done()
+	}()
+
+	// XXX use CopySourceIfUnmodifiedSince to ensure that
+	// we are copying from the same object
+	params := &s3.UploadPartCopyInput{
+		Bucket:            &fs.bucket,
+		Key:               fs.key(to),
+		CopySource:        aws.String(pathEscape(from)),
+		UploadId:          &mpuId,
+		CopySourceRange:   &bytes,
+		CopySourceIfMatch: srcEtag,
+		PartNumber:        &part,
+	}
+
+	s3Log.Debug(params)
+
+	resp, err := fs.s3.UploadPartCopy(params)
+	if err != nil {
+		s3Log.Errorf("UploadPartCopy %v = %v", params, err)
+		*errout = mapAwsError(err)
+		return
+	}
+
+	*etag = resp.CopyPartResult.ETag
+	return
+}
+
+func sizeToParts(size int64) int {
+	const PART_SIZE = 5 * 1024 * 1024 * 1024
+
+	nParts := int(size / PART_SIZE)
+	if size%PART_SIZE != 0 {
+		nParts++
+	}
+	return nParts
+}
+
+func mpuCopyParts(fs *Goofys, size int64, from string, to string, mpuId string,
+	wg *sync.WaitGroup, srcEtag *string, etags []*string, err *error) {
+
+	const PART_SIZE = 5 * 1024 * 1024 * 1024
+
+	rangeFrom := int64(0)
+	rangeTo := int64(0)
+
+	for i := int64(1); rangeTo < size; i++ {
+		rangeFrom = rangeTo
+		rangeTo = i * PART_SIZE
+		if rangeTo > size {
+			rangeTo = size
+		}
+		bytes := fmt.Sprintf("bytes=%v-%v", rangeFrom, rangeTo-1)
+
+		wg.Add(1)
+		go mpuCopyPart(fs, from, to, mpuId, bytes, i, wg, srcEtag, &etags[i-1], err)
+	}
+}
+
+func copyObjectMultipart(fs *Goofys, size int64, from string, to string, mpuId string,
+	srcEtag *string, metadata map[string]*string) (err error) {
+	var wg sync.WaitGroup
+	nParts := sizeToParts(size)
+	etags := make([]*string, nParts)
+
+	if mpuId == "" {
+		params := &s3.CreateMultipartUploadInput{
+			Bucket:       &fs.bucket,
+			Key:          fs.key(to),
+			StorageClass: &fs.flags.StorageClass,
+			ContentType:  fs.getMimeType(to),
+			Metadata:     metadata,
+		}
+
+		if fs.flags.UseSSE {
+			params.ServerSideEncryption = &fs.sseType
+			if fs.flags.UseKMS && fs.flags.KMSKeyID != "" {
+				params.SSEKMSKeyId = &fs.flags.KMSKeyID
+			}
+		}
+
+		if fs.flags.ACL != "" {
+			params.ACL = &fs.flags.ACL
+		}
+
+		resp, err := fs.s3.CreateMultipartUpload(params)
+		if err != nil {
+			return mapAwsError(err)
+		}
+
+		mpuId = *resp.UploadId
+	}
+
+	mpuCopyParts(fs, size, from, to, mpuId, &wg, srcEtag, etags, &err)
+	wg.Wait()
+
+	if err != nil {
+		return
+	} else {
+		parts := make([]*s3.CompletedPart, nParts)
+		for i := 0; i < nParts; i++ {
+			parts[i] = &s3.CompletedPart{
+				ETag:       etags[i],
+				PartNumber: aws.Int64(int64(i + 1)),
+			}
+		}
+
+		params := &s3.CompleteMultipartUploadInput{
+			Bucket:   &fs.bucket,
+			Key:      fs.key(to),
+			UploadId: &mpuId,
+			MultipartUpload: &s3.CompletedMultipartUpload{
+				Parts: parts,
+			},
+		}
+
+		s3Log.Debug(params)
+
+		_, err := fs.s3.CompleteMultipartUpload(params)
+		if err != nil {
+			s3Log.Errorf("Complete MPU %v = %v", params, err)
+			return mapAwsError(err)
+		}
+	}
+
+	return
+}
+
+func copyObjectMaybeMultipart(fs *Goofys, size int64, from string, to string, srcEtag *string, metadata map[string]*string) (err error) {
+
+	if size == -1 || srcEtag == nil || metadata == nil {
+		params := &s3.HeadObjectInput{Bucket: &fs.bucket, Key: fs.key(from)}
+		resp, err := fs.s3.HeadObject(params)
+		if err != nil {
+			return mapAwsError(err)
+		}
+
+		size = *resp.ContentLength
+		metadata = resp.Metadata
+		srcEtag = resp.ETag
+	}
+
+	from = fs.bucket + "/" + *fs.key(from)
+
+	if size > 5*1024*1024*1024 {
+		return copyObjectMultipart(fs, size, from, to, "", srcEtag, metadata)
+	}
+
+	params := &s3.CopyObjectInput{
+		Bucket:            &fs.bucket,
+		CopySource:        aws.String(pathEscape(from)),
+		Key:               fs.key(to),
+		StorageClass:      &fs.flags.StorageClass,
+		ContentType:       fs.getMimeType(to),
+		Metadata:          metadata,
+		MetadataDirective: aws.String(s3.MetadataDirectiveReplace),
+	}
+
+	s3Log.Debug(params)
+
+	if fs.flags.UseSSE {
+		params.ServerSideEncryption = &fs.sseType
+		if fs.flags.UseKMS && fs.flags.KMSKeyID != "" {
+			params.SSEKMSKeyId = &fs.flags.KMSKeyID
+		}
+	}
+
+	if fs.flags.ACL != "" {
+		params.ACL = &fs.flags.ACL
+	}
+
+	resp, err := fs.s3.CopyObject(params)
+	if err != nil {
+		s3Log.Errorf("CopyObject %v = %v", params, err)
+		err = mapAwsError(err)
+	}
+	s3Log.Debug(resp)
+
+	return
+}
+
+func renameObject(fs *Goofys, size int64, fromFullName string, toFullName string) (err error) {
+	err = copyObjectMaybeMultipart(fs, size, fromFullName, toFullName, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -1299,162 +888,254 @@ func (parent *Inode) Rename(fs *Goofys, from string, newParent *Inode, to string
 	if err != nil {
 		return mapAwsError(err)
 	}
+	s3Log.Debugf("Deleted %v", delParams)
 
 	return
 }
 
-func (inode *Inode) OpenDir() (dh *DirHandle) {
-	inode.logFuse("OpenDir")
-
-	dh = NewDirHandle(inode)
-
-	inode.mu.Lock()
-	defer inode.mu.Unlock()
-
-	inode.handles[dh] = true
-
-	return
+func (parent *Inode) addDotAndDotDot() {
+	fs := parent.fs
+	en := &DirHandleEntry{
+		Name:       aws.String("."),
+		Type:       fuseutil.DT_Directory,
+		Attributes: &fs.rootAttrs,
+		Offset:     1,
+	}
+	fs.insertInodeFromDirEntry(parent, en)
+	en = &DirHandleEntry{
+		Name:       aws.String(".."),
+		Type:       fuseutil.DT_Directory,
+		Attributes: &fs.rootAttrs,
+		Offset:     2,
+	}
+	fs.insertInodeFromDirEntry(parent, en)
 }
 
-// Dirents, sorted by name.
-type sortedDirents []fuseutil.Dirent
-
-func (p sortedDirents) Len() int           { return len(p) }
-func (p sortedDirents) Less(i, j int) bool { return p[i].Name < p[j].Name }
-func (p sortedDirents) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
-
-func makeDirEntry(name string, t fuseutil.DirentType) fuseutil.Dirent {
-	return fuseutil.Dirent{Name: name, Type: t, Inode: fuseops.RootInodeID + 1}
+// if I had seen a/ and a/b, and now I get a/c, that means a/b is
+// done, but not a/
+func (parent *Inode) isParentOf(inode *Inode) bool {
+	return inode.Parent != nil && (parent == inode.Parent || parent.isParentOf(inode.Parent))
 }
 
-// LOCKS_REQUIRED(dh.mu)
-func (dh *DirHandle) ReadDir(fs *Goofys, offset fuseops.DirOffset) (*fuseutil.Dirent, error) {
-	// If the request is for offset zero, we assume that either this is the first
-	// call or rewinddir has been called. Reset state.
-	if offset == 0 {
-		dh.Entries = nil
-	}
-
-	if offset == 0 {
-		e := makeDirEntry(".", fuseutil.DT_Directory)
-		e.Offset = 1
-		dh.NameToEntry["."] = DirHandleEntry{}.Init(&fs.rootAttrs)
-		return &e, nil
-	} else if offset == 1 {
-		e := makeDirEntry("..", fuseutil.DT_Directory)
-		e.Offset = 2
-		dh.NameToEntry[".."] = DirHandleEntry{}.Init(&fs.rootAttrs)
-		return &e, nil
-	}
-
-	i := int(offset) - dh.BaseOffset - 2
-	if i < 0 {
-		panic(fmt.Sprintf("invalid offset %v, base=%v", offset, dh.BaseOffset))
-	}
-
-	if i >= len(dh.Entries) {
-		if dh.Marker != nil {
-			// we need to fetch the next page
-			dh.Entries = nil
-			dh.BaseOffset += i
-			i = 0
+func sealPastDirs(dirs map[*Inode]bool, d *Inode) {
+	for p, sealed := range dirs {
+		if p != d && !sealed && !p.isParentOf(d) {
+			dirs[p] = true
 		}
 	}
+	// I just read something in d, obviously it's not done yet
+	dirs[d] = false
+}
 
-	if dh.Entries == nil {
-		prefix := *fs.key(*dh.inode.FullName)
-		if len(*dh.inode.FullName) != 0 {
-			prefix += "/"
-		}
+func (parent *Inode) insertSubTree(path string, obj *s3.Object, dirs map[*Inode]bool) {
+	fs := parent.fs
+	slash := strings.Index(path, "/")
+	if slash == -1 {
+		fs.insertInodeFromDirEntry(parent, objectToDirEntry(fs, obj, path, false))
+		sealPastDirs(dirs, parent)
+	} else {
+		dir := path[:slash]
+		path = path[slash+1:]
 
-		params := &s3.ListObjectsInput{
-			Bucket:    &fs.bucket,
-			Delimiter: aws.String("/"),
-			Marker:    dh.Marker,
-			Prefix:    &prefix,
-			//MaxKeys:      aws.Int64(3),
-		}
+		if len(path) == 0 {
+			inode := fs.insertInodeFromDirEntry(parent, objectToDirEntry(fs, obj, dir, true))
+			inode.addDotAndDotDot()
 
-		// try not to hold the lock when we make the request
-		dh.mu.Unlock()
-
-		resp, err := fs.s3.ListObjects(params)
-		if err != nil {
-			dh.mu.Lock()
-			return nil, mapAwsError(err)
-		}
-
-		s3Log.Debug(resp)
-		dh.mu.Lock()
-
-		dh.Entries = make([]fuseutil.Dirent, 0, len(resp.CommonPrefixes)+len(resp.Contents))
-
-		for _, dir := range resp.CommonPrefixes {
-			// strip trailing /
-			dirName := (*dir.Prefix)[0 : len(*dir.Prefix)-1]
-			// strip previous prefix
-			dirName = dirName[len(*params.Prefix):]
-			if len(dirName) == 0 {
-				continue
-			}
-			dh.Entries = append(dh.Entries, makeDirEntry(dirName, fuseutil.DT_Directory))
-			dh.NameToEntry[dirName] = DirHandleEntry{}.Init(&fs.rootAttrs)
-		}
-
-		for _, obj := range resp.Contents {
-			baseName := (*obj.Key)[len(prefix):]
-			if len(baseName) == 0 {
-				// this is a directory blob
-				continue
-			}
-			dh.Entries = append(dh.Entries, makeDirEntry(baseName, fuseutil.DT_File))
-			dh.NameToEntry[baseName] = DirHandleEntry{}.Init(&fuseops.InodeAttributes{
-				Size:   uint64(*obj.Size),
-				Nlink:  1,
-				Mode:   fs.flags.FileMode,
-				Atime:  *obj.LastModified,
-				Mtime:  *obj.LastModified,
-				Ctime:  *obj.LastModified,
-				Crtime: *obj.LastModified,
-				Uid:    fs.flags.Uid,
-				Gid:    fs.flags.Gid,
-			})
-			dh.NameToEntry[baseName].ETag = obj.ETag
-			dh.NameToEntry[baseName].StorageClass = obj.StorageClass
-		}
-
-		sort.Sort(sortedDirents(dh.Entries))
-
-		// Fix up offset fields.
-		for i := 0; i < len(dh.Entries); i++ {
-			en := &dh.Entries[i]
-			// offset is 1 based, also need to account for "." and ".."
-			en.Offset = fuseops.DirOffset(i+dh.BaseOffset) + 1 + 2
-		}
-
-		if *resp.IsTruncated {
-			dh.Marker = resp.NextMarker
+			sealPastDirs(dirs, inode)
 		} else {
-			dh.Marker = nil
+			// ensure that the potentially implicit dir is added
+			en := &DirHandleEntry{
+				Name:       &dir,
+				Type:       fuseutil.DT_Directory,
+				Attributes: &fs.rootAttrs,
+				Offset:     1,
+			}
+			inode := fs.insertInodeFromDirEntry(parent, en)
+			// mark this dir but don't seal anything else
+			// until we get to the leaf
+			dirs[inode] = false
+
+			inode.addDotAndDotDot()
+			inode.insertSubTree(path, obj, dirs)
+		}
+	}
+}
+
+func (parent *Inode) readDirFromCache(offset fuseops.DirOffset) (en *DirHandleEntry, ok bool) {
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+
+	if !expired(parent.dir.DirTime, parent.fs.flags.TypeCacheTTL) {
+		ok = true
+
+		if int(offset) >= len(parent.dir.Children) {
+			return
+		}
+		child := parent.dir.Children[offset]
+
+		en = &DirHandleEntry{
+			Name:       child.Name,
+			Inode:      child.Id,
+			Offset:     offset + 1,
+			Attributes: child.Attributes,
+		}
+		if child.isDir() {
+			en.Type = fuseutil.DT_Directory
+		} else {
+			en.Type = fuseutil.DT_File
+		}
+
+	}
+	return
+}
+
+func (parent *Inode) LookUpInodeNotDir(name string, c chan s3.HeadObjectOutput, errc chan error) {
+	params := &s3.HeadObjectInput{Bucket: &parent.fs.bucket, Key: parent.fs.key(name)}
+	resp, err := parent.fs.s3.HeadObject(params)
+	if err != nil {
+		errc <- mapAwsError(err)
+		return
+	}
+
+	s3Log.Debug(resp)
+	c <- *resp
+}
+
+func (parent *Inode) LookUpInodeDir(name string, c chan s3.ListObjectsOutput, errc chan error) {
+	params := &s3.ListObjectsInput{
+		Bucket:    &parent.fs.bucket,
+		Delimiter: aws.String("/"),
+		MaxKeys:   aws.Int64(1),
+		Prefix:    parent.fs.key(name + "/"),
+	}
+
+	resp, err := parent.fs.s3.ListObjects(params)
+	if err != nil {
+		errc <- mapAwsError(err)
+		return
+	}
+
+	s3Log.Debug(resp)
+	c <- *resp
+}
+
+// returned inode has nil Id
+func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *Inode, err error) {
+	errObjectChan := make(chan error, 1)
+	objectChan := make(chan s3.HeadObjectOutput, 1)
+	errDirBlobChan := make(chan error, 1)
+	dirBlobChan := make(chan s3.HeadObjectOutput, 1)
+	var errDirChan chan error
+	var dirChan chan s3.ListObjectsOutput
+
+	checking := 3
+	var checkErr [3]error
+
+	if parent.fs.s3 == nil {
+		panic("s3 disabled")
+	}
+
+	go parent.LookUpInodeNotDir(fullName, objectChan, errObjectChan)
+	if !parent.fs.flags.Cheap {
+		go parent.LookUpInodeNotDir(fullName+"/", dirBlobChan, errDirBlobChan)
+		if !parent.fs.flags.ExplicitDir {
+			errDirChan = make(chan error, 1)
+			dirChan = make(chan s3.ListObjectsOutput, 1)
+			go parent.LookUpInodeDir(fullName, dirChan, errDirChan)
 		}
 	}
 
-	if i == len(dh.Entries) {
-		// we've reached the end
-		return nil, nil
-	} else if i > len(dh.Entries) {
-		return nil, fuse.EINVAL
+	for {
+		select {
+		case resp := <-objectChan:
+			err = nil
+			// XXX/TODO if both object and object/ exists, return dir
+			inode = NewInode(parent.fs, parent, &name, &fullName)
+			inode.Attributes = &InodeAttributes{
+				Size:  uint64(aws.Int64Value(resp.ContentLength)),
+				Mtime: *resp.LastModified,
+			}
+
+			// don't want to point to the attribute because that
+			// can get updated
+			size := inode.Attributes.Size
+			inode.KnownSize = &size
+
+			inode.fillXattrFromHead(&resp)
+			return
+		case err = <-errObjectChan:
+			checking--
+			checkErr[0] = err
+			s3Log.Debugf("HEAD %v = %v", fullName, err)
+		case resp := <-dirChan:
+			err = nil
+			if len(resp.CommonPrefixes) != 0 || len(resp.Contents) != 0 {
+				inode = NewInode(parent.fs, parent, &name, &fullName)
+				inode.ToDir()
+				if len(resp.Contents) != 0 && *resp.Contents[0].Key == name+"/" {
+					// it's actually a dir blob
+					entry := resp.Contents[0]
+					if entry.ETag != nil {
+						inode.s3Metadata["etag"] = []byte(*entry.ETag)
+					}
+					if entry.StorageClass != nil {
+						inode.s3Metadata["storage-class"] = []byte(*entry.StorageClass)
+					}
+
+				}
+				// if cheap is not on, the dir blob
+				// could exist but this returned first
+				if inode.fs.flags.Cheap {
+					inode.ImplicitDir = true
+				}
+				return
+			} else {
+				checkErr[2] = fuse.ENOENT
+				checking--
+			}
+		case err = <-errDirChan:
+			checking--
+			checkErr[2] = err
+			s3Log.Debugf("LIST %v/ = %v", fullName, err)
+		case resp := <-dirBlobChan:
+			err = nil
+			inode = NewInode(parent.fs, parent, &name, &fullName)
+			inode.ToDir()
+			inode.fillXattrFromHead(&resp)
+			return
+		case err = <-errDirBlobChan:
+			checking--
+			checkErr[1] = err
+			s3Log.Debugf("HEAD %v/ = %v", fullName, err)
+		}
+
+		switch checking {
+		case 2:
+			if parent.fs.flags.Cheap {
+				go parent.LookUpInodeNotDir(fullName+"/", dirBlobChan, errDirBlobChan)
+			}
+		case 1:
+			if parent.fs.flags.ExplicitDir {
+				checkErr[2] = fuse.ENOENT
+				goto doneCase
+			} else if parent.fs.flags.Cheap {
+				errDirChan = make(chan error, 1)
+				dirChan = make(chan s3.ListObjectsOutput, 1)
+				go parent.LookUpInodeDir(fullName, dirChan, errDirChan)
+			}
+			break
+		doneCase:
+			fallthrough
+		case 0:
+			for _, e := range checkErr {
+				if e != fuse.ENOENT {
+					err = e
+					return
+				}
+			}
+
+			err = fuse.ENOENT
+			return
+		}
 	}
-
-	return &dh.Entries[i], nil
-}
-
-func (dh *DirHandle) CloseDir() error {
-	inode := dh.inode
-
-	inode.mu.Lock()
-	defer inode.mu.Unlock()
-	delete(inode.handles, dh)
-
-	return nil
 }

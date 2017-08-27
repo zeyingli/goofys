@@ -49,7 +49,7 @@ $ brew install goofys
 
 * Or build from source:
 
-```
+```ShellSession
 $ export GOPATH=$HOME/work
 $ go get github.com/kahing/goofys
 $ go install github.com/kahing/goofys
@@ -81,16 +81,27 @@ Got more questions? Check out [questions other people asked](https://github.com/
 
 # Benchmark
 
-Using `--stat-cache-ttl 0 --type-cache-ttl 0` for goofys
+Using `--stat-cache-ttl 1s --type-cache-ttl 1s` for goofys
 `-ostat_cache_expire=1` for s3fs to simulate cold runs. Detail for the
 benchmark can be found in
 [bench.sh](https://github.com/kahing/goofys/blob/master/bench/bench.sh). [Raw data](https://github.com/kahing/goofys/blob/master/bench/)
-is available as well. Test was run on an EC2 hi1.4xlarge in us-west-2a
+is available as well. Test was run on an EC2 m4.16xlarge in us-west-2a
 connecting to a bucket in us-west-2. Units are seconds.
 
 ![Benchmark result](/bench/bench.png?raw=true "Benchmark")
 
 (†) riofs does not wait for HTTP response before returning from `release()`, so the create files benchmarks do not measure the right thing for it
+
+<a name="runbenchmark"></a>
+To run the benchmark, do:
+
+```ShellSession
+$ cat > ~/.passwd-riofs
+export AWS_ACCESS_KEY_ID=AKID1234567890
+export AWS_SECRET_ACCESS_KEY=MY-SECRET-KEY
+$ sudo docker run -e BUCKET=$TESTBUCKET --rm --privileged --net=host -v  ~/.passwd-riofs:/root/.passwd-riofs kahing/goofys-bench
+# result will be written to $TESTBUCKET
+```
 
 # License
 
@@ -120,6 +131,7 @@ In addition to the items above, the following supportable but not yet implemente
 goofys has been tested with the following non-AWS providers:
 
 * Amplidata
+* DreamObjects (Ceph)
 * EMC Atmos
 * Google Cloud Storage
 * OpenStack Swift

@@ -16,8 +16,11 @@
 package internal
 
 import (
+	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
+	"os/exec"
 	"strings"
 	"text/tabwriter"
 	"text/template"
@@ -62,6 +65,9 @@ TUNING OPTIONS:
    {{end}}
 AWS S3 OPTIONS:
    {{range category .Flags "aws"}}{{.}}
+   {{end}}
+MISC OPTIONS:
+   {{range category .Flags "misc"}}{{.}}
    {{end}}{{end}}{{if .Copyright }}
 COPYRIGHT:
    {{.Copyright}}
@@ -76,7 +82,7 @@ func NewApp() (app *cli.App) {
 
 	app = &cli.App{
 		Name:     "goofys",
-		Version:  "0.0.13-" + VersionHash,
+		Version:  "0.0.16-" + VersionHash,
 		Usage:    "Mount an S3 bucket locally",
 		HideHelp: true,
 		Writer:   os.Stderr,
@@ -94,6 +100,14 @@ func NewApp() (app *cli.App) {
 			cli.StringSliceFlag{
 				Name:  "o",
 				Usage: "Additional system-specific mount options. Be careful!",
+			},
+
+			cli.StringFlag{
+				Name: "cache",
+				Usage: "Directory to use for data cache. " +
+					"Requires catfs and `-o allow_other'. " +
+					"Can also pass in other catfs options " +
+					"(ex: --cache \"--free:10%:$HOME/cache\") (default: off)",
 			},
 
 			cli.IntFlag{
@@ -240,6 +254,10 @@ func NewApp() (app *cli.App) {
 		flagCategories[f] = "tuning"
 	}
 
+	for _, f := range []string{"help, h", "debug_fuse", "debug_s3", "version, v", "f"} {
+		flagCategories[f] = "misc"
+	}
+
 	cli.HelpPrinter = func(w io.Writer, templ string, data interface{}) {
 		w = tabwriter.NewWriter(w, 1, 8, 2, ' ', 0)
 		var tmplGet = template.Must(template.New("help").Funcs(funcMap).Parse(templ))
@@ -251,11 +269,16 @@ func NewApp() (app *cli.App) {
 
 type FlagStorage struct {
 	// File system
-	MountOptions map[string]string
-	DirMode      os.FileMode
-	FileMode     os.FileMode
-	Uid          uint32
-	Gid          uint32
+	MountOptions      map[string]string
+	MountPoint        string
+	MountPointArg     string
+	MountPointCreated string
+
+	Cache    []string
+	DirMode  os.FileMode
+	FileMode os.FileMode
+	Uid      uint32
+	Gid      uint32
 
 	// S3
 	Endpoint       string
@@ -304,10 +327,19 @@ func parseOptions(m map[string]string, s string) {
 	return
 }
 
+func (flags *FlagStorage) Cleanup() {
+	if flags.MountPointCreated != "" && flags.MountPointCreated != flags.MountPointArg {
+		err := os.Remove(flags.MountPointCreated)
+		if err != nil {
+			log.Errorf("rmdir %v = %v", flags.MountPointCreated, err)
+		}
+	}
+}
+
 // Add the flags accepted by run to the supplied flag set, returning the
 // variables into which the flags will parse.
-func PopulateFlags(c *cli.Context) (flags *FlagStorage) {
-	flags = &FlagStorage{
+func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
+	flags := &FlagStorage{
 		// File system
 		MountOptions: make(map[string]string),
 		DirMode:      os.FileMode(c.Int("dir-mode")),
@@ -339,16 +371,81 @@ func PopulateFlags(c *cli.Context) (flags *FlagStorage) {
 		Foreground: c.Bool("f"),
 	}
 
+	// Handle the repeated "-o" flag.
+	for _, o := range c.StringSlice("o") {
+		parseOptions(flags.MountOptions, o)
+	}
+
+	flags.MountPointArg = c.Args()[1]
+	flags.MountPoint = flags.MountPointArg
+	var err error
+
+	defer func() {
+		if err != nil {
+			flags.Cleanup()
+		}
+	}()
+
+	if c.IsSet("cache") {
+		cache := c.String("cache")
+		cacheArgs := strings.Split(c.String("cache"), ":")
+		cacheDir := cacheArgs[len(cacheArgs)-1]
+		cacheArgs = cacheArgs[:len(cacheArgs)-1]
+
+		fi, err := os.Stat(cacheDir)
+		if err != nil || !fi.IsDir() {
+			io.WriteString(cli.ErrWriter,
+				fmt.Sprintf("Invalid value \"%v\" for --cache: not a directory\n\n",
+					cacheDir))
+			return nil
+		}
+
+		if _, ok := flags.MountOptions["allow_other"]; !ok {
+			flags.MountPointCreated, err = ioutil.TempDir("", ".goofys-mnt")
+			if err != nil {
+				io.WriteString(cli.ErrWriter,
+					fmt.Sprintf("Unable to create temp dir: %v", err))
+				return nil
+			}
+			flags.MountPoint = flags.MountPointCreated
+		}
+
+		cacheArgs = append(cacheArgs, "--test")
+
+		if flags.MountPointArg == flags.MountPoint {
+			cacheArgs = append(cacheArgs, "-ononempty")
+		}
+
+		cacheArgs = append(cacheArgs, "--")
+		cacheArgs = append(cacheArgs, flags.MountPoint)
+		cacheArgs = append(cacheArgs, cacheDir)
+		cacheArgs = append(cacheArgs, flags.MountPointArg)
+
+		catfs := exec.Command("catfs", cacheArgs...)
+		_, err = catfs.Output()
+		if err != nil {
+			if ee, ok := err.(*exec.Error); ok {
+				io.WriteString(cli.ErrWriter,
+					fmt.Sprintf("--cache requires catfs (%v) but %v\n\n",
+						"http://github.com/kahing/catfs",
+						ee.Error()))
+			} else if ee, ok := err.(*exec.ExitError); ok {
+				io.WriteString(cli.ErrWriter,
+					fmt.Sprintf("Invalid value \"%v\" for --cache: %v\n\n",
+						cache, string(ee.Stderr)))
+			}
+			return nil
+		}
+
+		flags.Cache = cacheArgs[1:]
+	}
+
 	// KMS implies SSE
 	if flags.UseKMS {
 		flags.UseSSE = true
 	}
 
-	// Handle the repeated "-o" flag.
-	for _, o := range c.StringSlice("o") {
-		parseOptions(flags.MountOptions, o)
-	}
-	return
+	return flags
 }
 
 func MassageMountFlags(args []string) (ret []string) {
